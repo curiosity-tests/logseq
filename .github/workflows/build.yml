@@ -5,11 +5,11 @@ on:
   push:
     branches: [master]
     paths-ignore:
-      - '*.md'
+    - '*.md'
   pull_request:
     branches: [master]
     paths-ignore:
-      - '*.md'
+    - '*.md'
 
   workflow_dispatch:
     inputs:
@@ -43,22 +43,94 @@ jobs:
     name: Spell Check with Typos
     runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Actions Repository
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - name: Check spelling with custom config file
-        uses: crate-ci/typos@v1.16.8
-        with:
-          config: ./typos.toml
+    - name: Checkout Actions Repository
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: Check spelling with custom config file
+      uses: crate-ci/typos@v1.16.8
+      with:
+        config: ./typos.toml
 
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   test:
     strategy:
       matrix:
@@ -67,67 +139,139 @@ jobs:
     runs-on: ${{ matrix.operating-system }}
 
     steps:
-      - name: Checkout
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.33.0
+    - name: Checkout
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: Set up pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: 10.33.0
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'pnpm'
-          cache-dependency-path: pnpm-lock.yaml
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'pnpm'
+        cache-dependency-path: pnpm-lock.yaml
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'zulu'
-          java-version: ${{ env.JAVA_VERSION }}
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Set up Clojure
-        uses: DeLaGuardo/setup-clojure@13.5
-        with:
-          cli: ${{ env.CLOJURE_VERSION }}
-          bb: ${{ env.BABASHKA_VERSION }}
+    - name: Set up Clojure
+      uses: DeLaGuardo/setup-clojure@13.5
+      with:
+        cli: ${{ env.CLOJURE_VERSION }}
+        bb: ${{ env.BABASHKA_VERSION }}
 
-      - name: Clojure cache
-        uses: actions/cache@v4
-        id: clojure-deps
-        with:
-          path: |
-            ~/.m2/repository
-            ~/.gitlibs
-          key: ${{ runner.os }}-clojure-deps-${{ hashFiles('deps.edn') }}
-          restore-keys: ${{ runner.os }}-clojure-deps-
+    - name: Clojure cache
+      uses: actions/cache@v4
+      id: clojure-deps
+      with:
+        path: |
+          ~/.m2/repository
+          ~/.gitlibs
+        key: ${{ runner.os }}-clojure-deps-${{ hashFiles('deps.edn') }}
+        restore-keys: ${{ runner.os }}-clojure-deps-
 
-      - name: Fetch Clojure deps
-        if: steps.clojure-deps.outputs.cache-hit != 'true'
-        run: clojure -A:cljs -P
+    - name: Fetch Clojure deps
+      if: steps.clojure-deps.outputs.cache-hit != 'true'
+      run: clojure -A:cljs -P
 
-      - name: Fetch pnpm deps
-        run: pnpm install --frozen-lockfile
+    - name: Fetch pnpm deps
+      run: pnpm install --frozen-lockfile
 
-      - name: Build test asset
-        run: clojure -M:test compile test
+    - name: Build test asset
+      run: clojure -M:test compile test
 
-      - name: Run ClojureScript query tests against basic query type
-        run: DB_QUERY_TYPE=basic pnpm cljs:run-test -r frontend.db.query-dsl-test
+    - name: Run ClojureScript query tests against basic query type
+      run: DB_QUERY_TYPE=basic pnpm cljs:run-test -r frontend.db.query-dsl-test
 
-      - name: Run ClojureScript tests
-        run: pnpm cljs:run-test
+    - name: Run ClojureScript tests
+      run: pnpm cljs:run-test
 
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   cli-e2e:
     name: CLI E2E tests
     strategy:
@@ -137,124 +281,268 @@ jobs:
     runs-on: ${{ matrix.operating-system }}
 
     steps:
-      - name: Checkout
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.33.0
+    - name: Checkout
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: Set up pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: 10.33.0
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'pnpm'
-          cache-dependency-path: |
-            pnpm-lock.yaml
-            cli/pnpm-lock.yaml
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'pnpm'
+        cache-dependency-path: |
+          pnpm-lock.yaml
+          cli/pnpm-lock.yaml
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'zulu'
-          java-version: ${{ env.JAVA_VERSION }}
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Set up Clojure
-        uses: DeLaGuardo/setup-clojure@13.5
-        with:
-          cli: ${{ env.CLOJURE_VERSION }}
-          bb: ${{ env.BABASHKA_VERSION }}
+    - name: Set up Clojure
+      uses: DeLaGuardo/setup-clojure@13.5
+      with:
+        cli: ${{ env.CLOJURE_VERSION }}
+        bb: ${{ env.BABASHKA_VERSION }}
 
-      - name: Set up OCaml
-        uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: ${{ env.OCAML_VERSION }}
+    - name: Set up OCaml
+      uses: ocaml/setup-ocaml@v3
+      with:
+        ocaml-compiler: ${{ env.OCAML_VERSION }}
 
-      - name: Clojure cache
-        uses: actions/cache@v4
-        id: clojure-deps
-        with:
-          path: |
-            ~/.m2/repository
-            ~/.gitlibs
-          key: ${{ runner.os }}-clojure-deps-cli-e2e-${{ hashFiles('deps.edn') }}
-          restore-keys: ${{ runner.os }}-clojure-deps-
+    - name: Clojure cache
+      uses: actions/cache@v4
+      id: clojure-deps
+      with:
+        path: |
+          ~/.m2/repository
+          ~/.gitlibs
+        key: ${{ runner.os }}-clojure-deps-cli-e2e-${{ hashFiles('deps.edn') }}
+        restore-keys: ${{ runner.os }}-clojure-deps-
 
-      - name: Fetch Clojure deps
-        if: steps.clojure-deps.outputs.cache-hit != 'true'
-        run: clojure -A:cljs -P
+    - name: Fetch Clojure deps
+      if: steps.clojure-deps.outputs.cache-hit != 'true'
+      run: clojure -A:cljs -P
 
-      - name: Fetch OCaml deps
-        working-directory: cli
-        run: opam install . --deps-only --with-test --yes
+    - name: Fetch OCaml deps
+      working-directory: cli
+      run: opam install . --deps-only --with-test --yes
 
-      - name: Fetch pnpm deps
-        run: pnpm install --frozen-lockfile
+    - name: Fetch pnpm deps
+      run: pnpm install --frozen-lockfile
 
-      - name: Fetch CLI pnpm deps
-        run: pnpm --dir cli install --frozen-lockfile --ignore-workspace
+    - name: Fetch CLI pnpm deps
+      run: pnpm --dir cli install --frozen-lockfile --ignore-workspace
 
-      - name: Run CLI E2E tests
-        run: opam exec -- bb dev:cli-e2e --jobs 1 --verbose
+    - name: Run CLI E2E tests
+      run: opam exec -- bb dev:cli-e2e --jobs 1 --verbose
 
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   lint:
     if: false   # racecar: scan/report job, not a build
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'zulu'
-          java-version: ${{ env.JAVA_VERSION }}
+    - name: Checkout
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Set up Clojure
-        uses: DeLaGuardo/setup-clojure@13.5
-        with:
-          cli: ${{ env.CLOJURE_VERSION }}
-          bb: ${{ env.BABASHKA_VERSION }}
+    - name: Set up Clojure
+      uses: DeLaGuardo/setup-clojure@13.5
+      with:
+        cli: ${{ env.CLOJURE_VERSION }}
+        bb: ${{ env.BABASHKA_VERSION }}
 
-      - name: Run clj-kondo lint
-        run: clojure -M:clj-kondo --parallel --lint src
+    - name: Run clj-kondo lint
+      run: clojure -M:clj-kondo --parallel --lint src
 
-      - name: Carve lint for unused vars
-        run: bb lint:carve
+    - name: Carve lint for unused vars
+      run: bb lint:carve
 
-      - name: Lint for vars that are too large
-        run: bb lint:large-vars
+    - name: Lint for vars that are too large
+      run: bb lint:large-vars
 
-      - name: Lint for namespaces that aren't documented
-        run: bb lint:ns-docstrings
+    - name: Lint for namespaces that aren't documented
+      run: bb lint:ns-docstrings
 
-      - name: Lint invalid translation entries
-        run: bb lang:validate-translations
+    - name: Lint invalid translation entries
+      run: bb lang:validate-translations
 
-      - name: Lint hardcoded user-facing strings
-        run: bb lang:lint-hardcoded
+    - name: Lint hardcoded user-facing strings
+      run: bb lang:lint-hardcoded
 
-      - name: Lint to keep worker independent of frontend
-        run: bb lint:worker-and-frontend-separate
+    - name: Lint to keep worker independent of frontend
+      run: bb lint:worker-and-frontend-separate
 
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   db-graph-test:
     strategy:
       matrix:
@@ -263,99 +551,171 @@ jobs:
     runs-on: ${{ matrix.operating-system }}
 
     steps:
-      - name: Checkout
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        continue-on-error: true
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::warning::CURIOSITY_ROOT unset in this step - in a container job the observables install on the host"; exit 1; }
-      - name: Set up pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10.33.0
+    - name: Checkout
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        lfs: false
+    - name: Set up pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: 10.33.0
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'pnpm'
-          cache-dependency-path: |
-            pnpm-lock.yaml
-            cli/pnpm-lock.yaml
-            deps/db/pnpm-lock.yaml
-            scripts/pnpm-lock.yaml
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'pnpm'
+        cache-dependency-path: |
+          pnpm-lock.yaml
+          cli/pnpm-lock.yaml
+          deps/db/pnpm-lock.yaml
+          scripts/pnpm-lock.yaml
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'zulu'
-          java-version: ${{ env.JAVA_VERSION }}
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: ${{ env.JAVA_VERSION }}
 
-      - name: Set up Clojure
-        uses: DeLaGuardo/setup-clojure@13.5
-        with:
-          cli: ${{ env.CLOJURE_VERSION }}
-          bb: ${{ env.BABASHKA_VERSION }}
+    - name: Set up Clojure
+      uses: DeLaGuardo/setup-clojure@13.5
+      with:
+        cli: ${{ env.CLOJURE_VERSION }}
+        bb: ${{ env.BABASHKA_VERSION }}
 
-      - name: Set up OCaml
-        uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: ${{ env.OCAML_VERSION }}
+    - name: Set up OCaml
+      uses: ocaml/setup-ocaml@v3
+      with:
+        ocaml-compiler: ${{ env.OCAML_VERSION }}
 
-      - name: Install CLI Linux runtime deps
-        run: sudo apt-get update && sudo apt-get install -y libsecret-1-0
+    - name: Install CLI Linux runtime deps
+      run: sudo apt-get update && sudo apt-get install -y libsecret-1-0
 
-      - name: Fetch OCaml deps
-        working-directory: cli
-        run: opam install . --deps-only --with-test --yes
+    - name: Fetch OCaml deps
+      working-directory: cli
+      run: opam install . --deps-only --with-test --yes
 
-      - name: Fetch scripts pnpm deps
-        run: pnpm --dir scripts install --frozen-lockfile --ignore-workspace
+    - name: Fetch scripts pnpm deps
+      run: pnpm --dir scripts install --frozen-lockfile --ignore-workspace
 
-      - name: Fetch root pnpm deps
-        run: pnpm install --frozen-lockfile
+    - name: Fetch root pnpm deps
+      run: pnpm install --frozen-lockfile
 
-      - name: Fetch CLI pnpm deps
-        run: pnpm --dir cli install --frozen-lockfile --ignore-workspace
+    - name: Fetch CLI pnpm deps
+      run: pnpm --dir cli install --frozen-lockfile --ignore-workspace
 
-      - name: Create DB graph with properties
-        run: cd scripts && pnpm exec nbb-logseq src/logseq/tasks/db_graph/create_graph_with_properties.cljs ./cli-root/graphs/properties-graph
+    - name: Create DB graph with properties
+      run: cd scripts && pnpm exec nbb-logseq src/logseq/tasks/db_graph/create_graph_with_properties.cljs ./cli-root/graphs/properties-graph
 
-      - name: Create DB graph with classes
-        run: cd scripts && pnpm exec nbb-logseq src/logseq/tasks/db_graph/create_graph_with_schema_org.cljs ./cli-root/graphs/schema-graph
+    - name: Create DB graph with classes
+      run: cd scripts && pnpm exec nbb-logseq src/logseq/tasks/db_graph/create_graph_with_schema_org.cljs ./cli-root/graphs/schema-graph
 
-      - name: Fetch deps/db pnpm deps
-        run: pnpm --dir deps/db install --frozen-lockfile --ignore-workspace
+    - name: Fetch deps/db pnpm deps
+      run: pnpm --dir deps/db install --frozen-lockfile --ignore-workspace
 
-      - name: Build logseq CLI runtime
-        run: |
-          opam exec -- pnpm cli:release
-          pnpm db-worker-node:release:bundle
-          pnpm --dir deps/db-sync build:node-adapter
-          node scripts/prepare-cli-package.mjs
-          pnpm --dir dist/cli-package install --prod --ignore-workspace
-          pnpm --dir dist/cli-package pack --pack-destination ../
+    - name: Build logseq CLI runtime
+      run: |
+        opam exec -- pnpm cli:release
+        pnpm db-worker-node:release:bundle
+        pnpm --dir deps/db-sync build:node-adapter
+        node scripts/prepare-cli-package.mjs
+        pnpm --dir dist/cli-package install --prod --ignore-workspace
+        pnpm --dir dist/cli-package pack --pack-destination ../
 
-      - name: Smoke test packaged CLI
-        run: node dist/cli-package/dist/logseq.js --version
+    - name: Smoke test packaged CLI
+      run: node dist/cli-package/dist/logseq.js --version
 
-      - name: Validate created DB graphs
-        run: |
-          node dist/cli-package/dist/logseq.js --root-dir scripts/cli-root --graph properties-graph --timeout-ms 3000 --profile --verbose graph validate
-          node dist/cli-package/dist/logseq.js --root-dir scripts/cli-root --graph schema-graph --timeout-ms 120000 --profile --verbose graph validate
+    - name: Validate created DB graphs
+      run: |
+        node dist/cli-package/dist/logseq.js --root-dir scripts/cli-root --graph properties-graph --timeout-ms 3000 --profile --verbose graph validate
+        node dist/cli-package/dist/logseq.js --root-dir scripts/cli-root --graph schema-graph --timeout-ms 120000 --profile --verbose graph validate
 
-      - name: Print db-worker-node logs on graph validation failure
-        if: failure()
-        run: |
-          find scripts/cli-root/graphs -maxdepth 2 -name 'db-worker-node-*.log' -print -exec tail -n 200 {} \; || true
-          pgrep -af db-worker-node || true
+    - name: Print db-worker-node logs on graph validation failure
+      if: failure()
+      run: |
+        find scripts/cli-root/graphs -maxdepth 2 -name 'db-worker-node-*.log' -print -exec tail -n 200 {} \; || true
+        pgrep -af db-worker-node || true
 
-      - name: Export a created DB graph
-        run: node dist/cli-package/dist/logseq.js --root-dir scripts/cli-root --graph properties-graph --timeout-ms 3000 graph export --type edn --file scripts/properties.edn
-      - name: Import an exported graph to confirm the export is working
-        run: node dist/cli-package/dist/logseq.js --root-dir scripts/cli-root --graph properties-graph-roundtrip --timeout-ms 20000 graph import --type edn --input scripts/properties.edn
+    - name: Export a created DB graph
+      run: node dist/cli-package/dist/logseq.js --root-dir scripts/cli-root --graph properties-graph --timeout-ms 3000 graph export --type edn --file scripts/properties.edn
+    - name: Import an exported graph to confirm the export is working
+      run: node dist/cli-package/dist/logseq.js --root-dir scripts/cli-root --graph properties-graph-roundtrip --timeout-ms 20000 graph import --type edn --input scripts/properties.edn
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
